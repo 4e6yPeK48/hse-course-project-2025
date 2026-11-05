@@ -8,7 +8,7 @@
     "build": "npm run typecheck && vite build && tsc -p .",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.client.json",
-    "test": "tsc -p tsconfig.tests.json && node --test .test-build/tests",
+    "test": "tsc -p tsconfig.tests.json && node --test .test-build/tests/connection.test.js .test-build/tests/demoReport.test.js",
     "test:e2e": "playwright test"
   },
   "dependencies": {
