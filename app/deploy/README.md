@@ -1,29 +1,12 @@
-# Простой деплой на VPS
+# Local demo
 
-Упрощенный вариант автодеплоя:
+Run `make up` from the repository root and open http://localhost:8080.
+`FEATUREBAN_PORT=8081 make up` selects another local port. `make down` stops the
+containers and keeps the database volume. Removing the volume deletes saved games.
 
-- Деплой запускается только при изменениях в `app/**`.
-- GitHub Actions берет данные подключения из `app/deploy/.env.deploy`.
-- На сервер копируется `app/deploy/deploy.sh` и запускается по SSH.
+`deploy.sh` starts the current checkout. It does not fetch/reset Git or contact the
+original team's VPS. Public hosting and TLS must be configured separately.
 
-## Как это работает
-
-1. Push в `main` с изменениями в `app/**`.
-2. Workflow читает `app/deploy/.env.deploy`.
-3. По SSH выполняет:
-   - принудительное выравнивание на `origin/main` в `/opt/featureban`
-   - `docker compose up --build -d` в `/opt/featureban/app`
-
-## Ручной запуск на сервере
-
-```bash
-cd /opt/featureban/app
-bash deploy/deploy.sh
-```
-
-## Важно
-
-Этот вариант небезопасен, так как пароль хранится в репозитории в открытом виде.
-
-Скрипт деплоя принудительно делает `checkout -f main` и `reset --hard origin/main`.
-Это значит, что любые локальные изменения в `/opt/featureban` на VPS будут потеряны при деплое.
+The upstream history contains a filled deployment credential file. It is removed
+from this fork's current version. If those credentials are still active, the VPS
+owner must rotate them; deleting a file does not remove it from Git history.

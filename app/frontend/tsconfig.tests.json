@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "target": "ES2022", "module": "commonjs", "outDir": ".test-build", "strict": true, "esModuleInterop": true, "skipLibCheck": true, "lib": ["ES2022", "DOM"] },
+  "include": ["tests/*.test.ts", "src/client/lib/connection.ts", "src/client/types.ts"]
+}

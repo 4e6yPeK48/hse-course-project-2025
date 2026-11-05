@@ -5,6 +5,7 @@ import StartPage from './pages/StartPage';
 import JoiningPage from './pages/JoiningPage';
 import CreatedPage from './pages/CreatedPage';
 import GamePage from './pages/GamePage';
+import ReportPage from './pages/ReportPage';
 
 const App: React.FC = () => {
   return (
@@ -13,6 +14,8 @@ const App: React.FC = () => {
       <Route path="/start" element={<StartPage />} />
       <Route path="/joining/:gamecode" element={<JoiningPage />} />
       <Route path="/created/:gamecode" element={<CreatedPage />} />
+      <Route path="/demo" element={<ReportPage demo />} />
+      <Route path="/game/:gamecode/report" element={<ReportPage />} />
       <Route path="/game/:gamecode" element={<GamePage />} />
     </Routes>
   );

@@ -51,7 +51,7 @@ const StartPage: React.FC = () => {
       });
       if (res.ok) {
         const body = await res.json();
-        navigate(`/created/${body.game_code}?facilitator_id=${body.facilitator_id}`);
+        navigate(`/created/${encodeURIComponent(body.game_code)}`);
       } else {
         setError('Ошибка создания игры');
       }
@@ -133,7 +133,9 @@ const StartPage: React.FC = () => {
             </div>
             {!showCreateSetup && (
               <form className="stack" action="/api/" method="post" onSubmit={handleJoinSubmit}>
+                <label htmlFor="game-code">Код комнаты</label>
                 <input
+                  id="game-code"
                   className={inputClass}
                   type="text"
                   name="game_code"
@@ -162,7 +164,7 @@ const StartPage: React.FC = () => {
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     {teams.map((t, idx) => (
                       <span key={idx} style={{ background: '#7952d5ff', padding: '4px 8px', borderRadius: 4 }}>
-                        {t} <button type="button" onClick={() => handleRemoveTeam(idx)} style={{ border: 'none', background: 'none', cursor: 'pointer' }}>x</button>
+                        {t} <button type="button" aria-label={`Удалить команду ${t}`} onClick={() => handleRemoveTeam(idx)} style={{ border: 'none', background: 'none', cursor: 'pointer' }}>x</button>
                       </span>
                     ))}
                   </div>
@@ -170,11 +172,12 @@ const StartPage: React.FC = () => {
                     <input
                       className="field"
                       type="text"
+                      aria-label="Название новой команды"
                       placeholder="Название команды"
                       value={teamNameInput}
                       onChange={(e) => setTeamNameInput(e.target.value)}
                     />
-                    <button type="button" className="btn" onClick={handleAddTeam}>+</button>
+                    <button type="button" className="btn" aria-label="Добавить команду" onClick={handleAddTeam}>+</button>
                   </div>
                 </div>
                 <div className="actions">
