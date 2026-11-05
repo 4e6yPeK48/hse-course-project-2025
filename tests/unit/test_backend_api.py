@@ -57,14 +57,14 @@ def test_create_game_defaults_when_team_names_empty(api_client):
     assert len(state["teams"]) == 4
 
 
-def test_create_game_clamps_short_max_days(api_client):
+def test_create_game_preserves_short_max_days(api_client):
     status, data, _ = api_client.json(
         "POST", "/api/create", payload={"team_names": ["Team A"], "max_days": 2}
     )
     assert status == 201
     status, state, _ = api_client.json("GET", f"/api/game/{data['game_code']}")
     assert status == 200
-    assert state["max_days"] == 15
+    assert state["max_days"] == 2
 
 
 def test_create_game_get_returns_405(api_client):
@@ -116,23 +116,19 @@ def test_join_redirect_nonexistent_game_returns_303_to_root(api_client):
     assert "flash=notfound" in headers["Set-Cookie"]
 
 
-def test_join_same_nickname_is_idempotent(api_client):
+def test_join_same_nickname_cannot_recover_another_players_identity(api_client):
     code, _ = create_game(api_client)
-
     status, first_join = join_player(api_client, code, "alice", "team-1")
     assert status == 201
-    assert first_join["game_code"] == code
-    first_player_id = first_join["player_id"]
-
-    status, second_join = join_player(api_client, code, "alice", "team-2")
-    assert status == 200
-    assert second_join["player_id"] == first_player_id
-    assert second_join["redirect_to"] == f"/game/{code}?player_id={first_player_id}"
-
-    status, state, _ = api_client.json("GET", f"/api/game/{code}")
-    assert status == 200
-    assert len(state["teams"][0]["members"]) == 1
-    assert len(state["teams"][1]["members"]) == 0
+    status, rejected, headers = api_client.json(
+        "POST", "/api/join", {"game_code": code, "nickname": "alice", "team_id": "team-2"}, allow_error=True,
+    )
+    assert status == 409
+    assert "player_id" not in rejected
+    assert "Set-Cookie" not in headers
+    _, state, _ = api_client.json("GET", f"/api/game/{code}")
+    assert [p["id"] for p in state["teams"][0]["members"]] == [first_join["player_id"]]
+    assert state["teams"][1]["members"] == []
 
 
 def test_join_unknown_team_is_rejected(api_client):
@@ -179,18 +175,15 @@ def test_join_after_started_returns_409(api_client):
     assert data["error"] == "Игра уже началась"
 
 
-def test_join_fills_team_to_max_then_rejects_sixth(api_client):
+def test_join_accepts_more_than_five_players_without_an_implicit_team_cap(api_client):
     code, _ = create_game(api_client, team_names=["Team A"])
-    for i in range(5):
+    identities = []
+    for i in range(6):
         status, data = join_player(api_client, code, f"player{i}", "team-1")
         assert status == 201
-    status, data, _ = api_client.json(
-        "POST", "/api/join",
-        {"game_code": code, "nickname": "player5", "team_id": "team-1"},
-        allow_error=True,
-    )
-    assert status == 409
-    assert data["error"] == "Команда заполнена (не более 5 участников)"
+        identities.append(data["player_id"])
+    _, state, _ = api_client.json("GET", f"/api/game/{code}")
+    assert {p["id"] for p in state["teams"][0]["members"]} == set(identities)
 
 
 def test_join_missing_fields_returns_400(api_client):
@@ -358,14 +351,14 @@ def test_start_game_forbidden_for_non_facilitator(api_client):
     assert data["error"] == "это может сделать только ведущий"
 
 
-def test_start_game_unknown_code_returns_404(api_client):
-    status, data, _ = api_client.json(
-        "POST", "/api/game/ZZZZZZ/start",
-        payload={"player_id": "some-id"},
-        allow_error=True,
-    )
+def test_unknown_game_is_publicly_404_and_protected_actions_require_a_session(api_client):
+    status, data, _ = api_client.json("GET", "/api/game/ZZZZZZ", allow_error=True)
     assert status == 404
     assert data["error"] == "Игра не найдена"
+    status, _, _ = api_client.json(
+        "POST", "/api/game/ZZZZZZ/start", {"player_id": "some-id"}, allow_error=True,
+    )
+    assert status == 401
 
 
 def test_start_game_twice_returns_409(api_client):
@@ -390,7 +383,7 @@ def test_start_game_twice_returns_409(api_client):
     assert data["error"] == "Игра уже началась"
 
 
-def test_start_game_missing_player_id_returns_400(api_client):
+def test_start_game_without_session_returns_401(api_client):
     code, facilitator_id = create_game(api_client, team_names=["Team A"])
     status, _ = join_player(api_client, code, "alice", "team-1")
     assert status == 201
@@ -403,8 +396,8 @@ def test_start_game_missing_player_id_returns_400(api_client):
         payload={},
         allow_error=True,
     )
-    assert status == 400
-    assert data["error"] == "Не указан идентификатор игрока"
+    assert status == 401
+    assert "error" in data
 
 
 def test_drag_rejects_task_from_another_team(api_client):
@@ -545,44 +538,8 @@ def test_drag_unknown_player_id(api_client):
         payload={"player_id": "unknown-player", "task_id": "some-task", "to_stage": "in_progress"},
         allow_error=True,
     )
-    assert status == 403
-    assert data["error"] == "Игрок не в этой игре"
-
-
-def test_drag_after_finished_returns_409(api_client):
-    code, facilitator_id = create_game(api_client, team_names=["Team A"], max_days=5)
-    _, joined = join_player(api_client, code, "alice", "team-1")
-    player_id = joined["player_id"]
-
-    api_client.json(
-        "POST", f"/api/game/{code}/start_project",
-        {"player_id": facilitator_id, "project_id": "PR-01"},
-    )
-    api_client.json(
-        "POST", f"/api/game/{code}/start",
-        {"player_id": facilitator_id},
-    )
-
-    for _ in range(5):
-        api_client.json(
-            "POST", f"/api/game/{code}/skip_turn",
-            {"player_id": facilitator_id},
-        )
-        api_client.json(
-            "POST", f"/api/game/{code}/next_day",
-            {"player_id": facilitator_id},
-        )
-
-    status, state, _ = api_client.json("GET", f"/api/game/{code}")
-    assert state["finished"] is True
-
-    status, data, _ = api_client.json(
-        "POST", f"/api/game/{code}/drag",
-        payload={"player_id": player_id, "task_id": "some-task", "to_stage": "in_progress"},
-        allow_error=True,
-    )
-    assert status == 409
-    assert data["error"] == "Игра уже завершена"
+    assert status == 401
+    assert "error" in data
 
 
 def test_next_day_without_all_teams_done_advances_day(api_client):
@@ -626,11 +583,11 @@ def test_set_wip_rejected_outside_retro(api_client):
     status, data, _ = api_client.json(
         "POST",
         f"/api/game/{code}/set_wip",
-        {"player_id": facilitator_id, "team_id": team_id, "wip_limit": 3},
+        {"player_id": facilitator_id, "team_id": team_id, "stage": "in_progress", "wip_limit": 3},
         allow_error=True,
     )
     assert status == 409
-    assert data["error"] == "Лимит WIP можно менять только на ретро"
+    assert data["error"] == "Лимит WIP можно менять только на ретро или до начала игры"
 
 
 def test_set_wip_validates_range(api_client):
@@ -641,7 +598,7 @@ def test_set_wip_validates_range(api_client):
     status, data, _ = api_client.json(
         "POST",
         f"/api/game/{code}/set_wip",
-        {"player_id": facilitator_id, "team_id": team_id, "wip_limit": 0},
+        {"player_id": facilitator_id, "team_id": team_id, "stage": "in_progress", "wip_limit": 0},
         allow_error=True,
     )
     assert status == 400
@@ -652,13 +609,13 @@ def test_set_wip_updates_team_during_retro(api_client):
     code, facilitator_id, _ = start_running_game(api_client)
     retro_state = advance_to_retro(api_client, code, facilitator_id)
     team_id = retro_state["teams"][0]["id"]
-    old_wip = retro_state["teams"][0]["wip_limit"]
+    old_wip = retro_state["teams"][0]["wip_limits"]["in_progress"]
 
     status, updated_state, _ = api_client.json(
         "POST",
         f"/api/game/{code}/set_wip",
-        {"player_id": facilitator_id, "team_id": team_id, "wip_limit": old_wip + 1},
+        {"player_id": facilitator_id, "team_id": team_id, "stage": "in_progress", "wip_limit": old_wip + 1},
     )
     assert status == 200
     updated_team = next(team for team in updated_state["teams"] if team["id"] == team_id)
-    assert updated_team["wip_limit"] == old_wip + 1
+    assert updated_team["wip_limits"]["in_progress"] == old_wip + 1

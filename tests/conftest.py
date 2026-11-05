@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
+from http.cookies import SimpleCookie
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib import error, request as urllib_request
 
@@ -61,41 +63,60 @@ def backend_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return binary_path
 
 
+class BackendProcess:
+    def __init__(self, binary: Path, data_dir: Path) -> None:
+        self.binary = binary
+        self.data_dir = data_dir
+        self.proc = None
+        self.log_file = None
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+
+    def start(self) -> None:
+        self.log_file = (self.data_dir / "server.log").open("a", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [str(self.binary)], cwd=self.data_dir,
+            env={**os.environ, "PORT": str(self.port), "DATABASE_PATH": str(self.data_dir / "game.db")},
+            stdout=self.log_file, stderr=subprocess.STDOUT, text=True,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and self.proc.poll() is None:
+            try:
+                with urllib_request.urlopen(f"{self.base_url}/api/hello", timeout=1) as resp:
+                    if resp.status == 200 and resp.read().decode().strip() == "hello from backend":
+                        return
+            except (OSError, error.URLError):
+                time.sleep(0.05)
+        self.stop()
+        pytest.fail("backend did not start:\n" + (self.data_dir / "server.log").read_text())
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            _kill_process_tree(self.proc)
+        if self.log_file is not None:
+            self.log_file.close()
+
+
 @pytest.fixture(scope="session")
 def backend_server(backend_binary: Path, tmp_path_factory: pytest.TempPathFactory) -> Iterable[str]:
-    log_dir = tmp_path_factory.mktemp("backend-logs")
-    log_path = log_dir / "server.log"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
-            [str(backend_binary)],
-            cwd=BACKEND_DIR,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            deadline = time.time() + 30
-            last_error: Optional[Exception] = None
-            while time.time() < deadline:
-                try:
-                    with urllib_request.urlopen("http://127.0.0.1:8080/api/hello", timeout=1) as resp:
-                        if resp.status == 200 and resp.read().decode("utf-8").strip() == "hello from backend":
-                            break
-                except Exception as exc:
-                    last_error = exc
-                    time.sleep(0.2)
-            else:
-                _kill_process_tree(proc)
-                log_text = log_path.read_text(encoding="utf-8", errors="replace")
-                pytest.fail(
-                    "backend server did not start in time\n"
-                    f"last error: {last_error!r}\n"
-                    f"log:\n{log_text}"
-                )
+    server = BackendProcess(backend_binary, tmp_path_factory.mktemp("backend-data"))
+    server.start()
+    try:
+        yield server.base_url
+    finally:
+        server.stop()
 
-            yield "http://127.0.0.1:8080"
-        finally:
-            _kill_process_tree(proc)
+
+@pytest.fixture
+def restartable_backend(backend_binary, tmp_path):
+    server = BackendProcess(backend_binary, tmp_path)
+    server.start()
+    try:
+        yield server
+    finally:
+        server.stop()
 
 
 class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
@@ -104,133 +125,64 @@ class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
 
 
 class APIClient:
+    """A browser session per real actor; payload IDs only select already-issued cookies."""
+
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
+        self.cookies: Dict[Tuple[str, str], str] = {}
 
-    def request_no_redirect(
-        self,
-        method: str,
-        path: str,
-        payload: Optional[Dict[str, Any]] = None,
-        *,
-        form_payload: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-    ) -> Tuple[int, str, Dict[str, str]]:
-        req_headers: Dict[str, str] = {}
-        data: Optional[bytes] = None
-        if form_payload is not None:
-            req_headers["Accept"] = "text/html"
-            req_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            data = form_payload.encode("utf-8") if form_payload else None
-        else:
-            req_headers["Accept"] = "application/json"
-            if payload is not None:
-                req_headers["Content-Type"] = "application/json"
-                data = json.dumps(payload).encode("utf-8")
-        if headers:
-            req_headers.update(headers)
-
-        req = urllib_request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers=req_headers,
-            method=method,
-        )
-        opener = urllib_request.build_opener(_NoRedirectHandler)
-        try:
-            with opener.open(req, timeout=10) as resp:
-                body = resp.read().decode("utf-8")
-                return resp.status, body, dict(resp.headers)
-        except error.HTTPError as exc:
-            body = exc.read().decode("utf-8") if exc.fp is not None else ""
-            return exc.code, body, dict(exc.headers)
+    def actor_headers(self, code: str, player_id: str) -> Dict[str, str]:
+        return {"Cookie": self.cookies[(code, player_id)]}
 
     def request(
-        self,
-        method: str,
-        path: str,
-        payload: Optional[Dict[str, Any]] = None,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_error: bool = False,
+        self, method: str, path: str, payload=None, *, headers=None,
+        allow_error=False, actor_id=None, form_payload=None, no_redirect=False,
     ) -> Tuple[int, str, Dict[str, str]]:
         req_headers = {"Accept": "application/json"}
-        if headers:
-            req_headers.update(headers)
-
+        room_parts = path.split("?", 1)[0].split("/")
+        code = room_parts[3] if len(room_parts) > 3 and room_parts[1:3] == ["api", "game"] else None
+        actor_id = actor_id or (payload or {}).get("player_id")
+        if code and (code, actor_id) in self.cookies:
+            req_headers.update(self.actor_headers(code, actor_id))
         data = None
-        if payload is not None:
-            req_headers.setdefault("Content-Type", "application/json")
+        if form_payload is not None:
+            req_headers.update({"Accept": "text/html", "Content-Type": "application/x-www-form-urlencoded"})
+            data = form_payload.encode("utf-8")
+        elif payload is not None:
+            req_headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
-
-        req = urllib_request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers=req_headers,
-            method=method,
-        )
+        req_headers.update(headers or {})
+        req = urllib_request.Request(f"{self.base_url}{path}", data=data, headers=req_headers, method=method)
+        opener = urllib_request.build_opener(_NoRedirectHandler) if no_redirect else urllib_request.build_opener()
         try:
-            with urllib_request.urlopen(req, timeout=10) as resp:
-                body = resp.read().decode("utf-8")
-                return resp.status, body, dict(resp.headers)
+            with opener.open(req, timeout=10) as resp:
+                status, body, response_headers = resp.status, resp.read().decode("utf-8"), dict(resp.headers)
         except error.HTTPError as exc:
-            body = exc.read().decode("utf-8")
-            if allow_error:
-                return exc.code, body, dict(exc.headers)
-            raise AssertionError(f"{method} {path} -> {exc.code}: {body}") from exc
+            status, body, response_headers = exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+            if not allow_error:
+                raise AssertionError(f"{method} {path} -> {status}: {body}") from exc
+        if status in (200, 201) and path in ("/api/create", "/api/join") and "Set-Cookie" in response_headers:
+            identity = json.loads(body)
+            cookie = SimpleCookie()
+            cookie.load(response_headers["Set-Cookie"])
+            actor = identity.get("facilitator_id") or identity.get("player_id")
+            self.cookies[(identity["game_code"], actor)] = "; ".join(f"{name}={m.value}" for name, m in cookie.items())
+        return status, body, response_headers
 
-    def form(
-        self,
-        method: str,
-        path: str,
-        payload: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_error: bool = False,
-    ) -> Tuple[int, str, Dict[str, str]]:
-        req_headers = {"Accept": "text/html", "Content-Type": "application/x-www-form-urlencoded"}
-        if headers:
-            req_headers.update(headers)
+    def request_no_redirect(self, method, path, payload=None, *, form_payload=None, headers=None):
+        return self.request(method, path, payload, form_payload=form_payload, headers=headers,
+                            allow_error=True, no_redirect=True)
 
-        data = payload.encode("utf-8") if payload else None
+    def form(self, method, path, payload, *, headers=None, allow_error=False):
+        return self.request(method, path, form_payload=payload, headers=headers, allow_error=allow_error)
 
-        req = urllib_request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers=req_headers,
-            method=method,
-        )
-        try:
-            with urllib_request.urlopen(req, timeout=10) as resp:
-                body = resp.read().decode("utf-8")
-                return resp.status, body, dict(resp.headers)
-        except error.HTTPError as exc:
-            body = exc.read().decode("utf-8")
-            if allow_error:
-                return exc.code, body, dict(exc.headers)
-            raise AssertionError(f"{method} {path} -> {exc.code}: {body}") from exc
+    def json(self, method, path, payload=None, *, headers=None, allow_error=False, actor_id=None):
+        status, body, response_headers = self.request(method, path, payload, headers=headers,
+                                                     allow_error=allow_error, actor_id=actor_id)
+        return status, json.loads(body) if body else None, response_headers
 
-    def json(
-        self,
-        method: str,
-        path: str,
-        payload: Optional[Dict[str, Any]] = None,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_error: bool = False,
-    ) -> Tuple[int, Any, Dict[str, str]]:
-        status, body, resp_headers = self.request(
-            method,
-            path,
-            payload,
-            headers=headers,
-            allow_error=allow_error,
-        )
-        parsed = json.loads(body) if body else None
-        return status, parsed, resp_headers
-
-    def text(self, method: str, path: str) -> Tuple[int, str, Dict[str, str]]:
-        return self.request(method, path, headers={"Accept": "text/plain"})
+    def text(self, method, path, *, actor_id=None):
+        return self.request(method, path, headers={"Accept": "text/plain"}, actor_id=actor_id)
 
 
 @pytest.fixture()

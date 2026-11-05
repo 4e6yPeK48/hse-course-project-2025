@@ -7,7 +7,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const FRONTEND_STATIC = path.join(__dirname, '..', 'static');
 
 const app = express();
-app.use(express.json());
+
 
 app.route('/create')
   .get((req, res) => {
@@ -28,8 +28,7 @@ function proxyOnError(err: any, req: any, res: any) {
 // --- Proxy /api/ to backend
 app.use('/api', createProxyMiddleware({
   target: 'http://backend:8080',
-  changeOrigin: true,
-  ws: true,
+  changeOrigin: false,
   pathRewrite: {
     '^/api': '/api'
   },
@@ -38,9 +37,9 @@ app.use('/api', createProxyMiddleware({
 }));
 
 // --- Proxy /ws/ to backend (WebSocket)
-app.use('/ws', createProxyMiddleware({
+const gameSocketProxy = createProxyMiddleware('/ws', {
   target: 'http://backend:8080',
-  changeOrigin: true,
+  changeOrigin: false,
   ws: true,
   logLevel: 'warn',
   onProxyReqWs: (proxyReq, req, socket, options, head) => {
@@ -56,7 +55,8 @@ app.use('/ws', createProxyMiddleware({
       proxyReq.setHeader('Connection', 'upgrade');
     }
   }
-}));
+});
+app.use('/ws', gameSocketProxy);
 
 // --- SPA fallback middleware
 app.use(history({
@@ -71,6 +71,8 @@ app.use(history({
 app.use(express.static(FRONTEND_STATIC));
 
 // --- Start server
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Frontend proxy listening on http://0.0.0.0:${PORT}`);
 });
+
+server.on('upgrade', gameSocketProxy.upgrade!);
