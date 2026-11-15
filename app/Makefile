@@ -1,8 +1,4 @@
-up:
-	docker compose up --build
+.PHONY: up down logs
 
-down:
-	docker compose down
-
-logs:
-	docker compose logs -f
+up down logs:
+	$(MAKE) -C .. $@

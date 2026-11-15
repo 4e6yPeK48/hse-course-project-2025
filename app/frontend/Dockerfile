@@ -1,25 +1,21 @@
 # Build stage
-FROM node:18-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
-COPY package.json package-lock.json* ./
-
-# Ставим всё (включая dev)
+COPY package.json package-lock.json ./
 RUN npm ci
-
-# Явно ставим tsc глобально, он появится в $PATH
-RUN npm install -g typescript
 
 COPY . .
 RUN npm run build
 
 # Runtime stage
-FROM node:18-alpine AS runtime
+FROM node:24-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PORT=80
+ENV PORT=3000
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/static ./static
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-EXPOSE 80
+USER node
+EXPOSE 3000
 CMD ["node", "dist/server.js"]

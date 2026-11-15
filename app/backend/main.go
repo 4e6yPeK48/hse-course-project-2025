@@ -1,8 +1,10 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -29,10 +31,10 @@ type Player struct {
 }
 
 type Task struct {
-	ID        string `json:"id"`
-	ProjectID string `json:"project_id"`
-	TeamID    string `json:"team_id"`
-	Stage     string `json:"stage"`
+	ID         string `json:"id"`
+	ProjectID  string `json:"project_id"`
+	TeamID     string `json:"team_id"`
+	Stage      string `json:"stage"`
 	Blocked    bool   `json:"blocked"`
 	OwnerID    string `json:"owner_id,omitempty"`
 	Penalty    bool   `json:"penalty,omitempty"`
@@ -81,25 +83,27 @@ type playerDayProgress struct {
 }
 
 type Game struct {
-	Code              string                        `json:"code"`
-	Started           bool                          `json:"started"`
-	Finished          bool                          `json:"finished"`
-	Phase             string                        `json:"phase"`
-	CurrentDay        int                           `json:"current_day"`
-	MaxDays           int                           `json:"max_days"`
-	CyclesCompleted   int                           `json:"cycles_completed"`
-	LastRetroDay      int                           `json:"-"`
-	ProjectsDone      int                           `json:"projects_done"`
-	Projects          map[string]*ProjectCard       `json:"-"`
-	ProjectWIPLimits  map[string]int                `json:"-"`
-	ProjectOrder      []string                      `json:"-"`
-	Teams             map[string]*Team              `json:"-"`
-	TeamOrder         []string                      `json:"-"`
-	Players           map[string]*Player            `json:"-"`
-	Tasks             map[string]*Task              `json:"-"`
-	FacilitatorID     string                        `json:"facilitator_id"`
-	TurnActionDone    map[string]bool               `json:"-"`
-	PlayerDayProgress map[string]*playerDayProgress `json:"-"`
+	Code                   string                        `json:"code"`
+	Revision               uint64                        `json:"revision"`
+	DailySnapshots         []DaySnapshot                 `json:"-"`
+	Started                bool                          `json:"started"`
+	Finished               bool                          `json:"finished"`
+	Phase                  string                        `json:"phase"`
+	CurrentDay             int                           `json:"current_day"`
+	MaxDays                int                           `json:"max_days"`
+	CyclesCompleted        int                           `json:"cycles_completed"`
+	LastRetroDay           int                           `json:"-"`
+	ProjectsDone           int                           `json:"projects_done"`
+	Projects               map[string]*ProjectCard       `json:"-"`
+	ProjectWIPLimits       map[string]int                `json:"-"`
+	ProjectOrder           []string                      `json:"-"`
+	Teams                  map[string]*Team              `json:"-"`
+	TeamOrder              []string                      `json:"-"`
+	Players                map[string]*Player            `json:"-"`
+	Tasks                  map[string]*Task              `json:"-"`
+	FacilitatorID          string                        `json:"facilitator_id"`
+	TurnActionDone         map[string]bool               `json:"-"`
+	PlayerDayProgress      map[string]*playerDayProgress `json:"-"`
 	TotalBlockedDays       int                           `json:"-"`
 	TasksDoneThisIteration int                           `json:"-"`
 	LastRetroThroughput    int                           `json:"-"`
@@ -107,20 +111,24 @@ type Game struct {
 }
 
 type Server struct {
-	mu          sync.RWMutex
-	games       map[string]*Game
-	gameCounter int64
-	taskCounter int64
-	rng         *rand.Rand
-	wsMu        sync.Mutex
-	wsGames     map[string]map[*wsClient]struct{}
+	mu           sync.RWMutex
+	games        map[string]*Game
+	gameCounter  int64
+	taskCounter  int64
+	mutationMu   sync.Mutex
+	db           *sql.DB
+	saveSnapshot func([]byte) error
+	sessions     map[string]map[string]session
+	metricWrites []func()
+	wsMu         sync.Mutex
+	wsGames      map[string]map[*wsClient]struct{}
 }
 
 func newServer() *Server {
 	return &Server{
-		games:   make(map[string]*Game),
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		wsGames: make(map[string]map[*wsClient]struct{}),
+		games:    make(map[string]*Game),
+		sessions: make(map[string]map[string]session),
+		wsGames:  make(map[string]map[*wsClient]struct{}),
 	}
 }
 
@@ -154,12 +162,12 @@ type projectState struct {
 }
 
 type GameMetrics struct {
-	CFD              map[string]int `json:"cfd"`
-	WIP              int            `json:"wip"`
-	LeadTime         float64        `json:"lead_time"`
-	Blocked          int            `json:"blocked"`
-	RetroDays        int            `json:"retro_days"`
-	Velocity         float64        `json:"velocity"`
+	CFD                 map[string]int `json:"cfd"`
+	WIP                 int            `json:"wip"`
+	LeadTime            float64        `json:"lead_time"`
+	Blocked             int            `json:"blocked"`
+	RetroDays           int            `json:"retro_days"`
+	Velocity            float64        `json:"velocity"`
 	TotalBlockedDays    int            `json:"total_blocked_days"`
 	TotalPenalties      int            `json:"total_penalties"`
 	AvgTaskCycleTime    float64        `json:"avg_task_cycle_time"`
@@ -168,6 +176,7 @@ type GameMetrics struct {
 
 type stateResponse struct {
 	Code                string          `json:"code"`
+	Revision            uint64          `json:"revision"`
 	Started             bool            `json:"started"`
 	Finished            bool            `json:"finished"`
 	Phase               string          `json:"phase"`
@@ -256,16 +265,17 @@ type gameSocketMessage struct {
 }
 
 var lobbyUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: sameOrigin,
 }
 
 var gameUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: sameOrigin,
 }
 
 func (c *wsClient) sendJSON(payload interface{}) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return c.conn.WriteJSON(payload)
 }
 
@@ -416,7 +426,7 @@ func (s *Server) makeProjects(teamOrder []string) (map[string]*ProjectCard, []st
 		tasksByTeam := make(map[string]int)
 		total := 0
 		for _, teamID := range teamOrder {
-			cnt := 1 + s.rng.Intn(3)
+			cnt := 1 + rand.Intn(3)
 			tasksByTeam[teamID] = cnt
 			total += cnt
 		}
@@ -568,6 +578,7 @@ func stateFromGame(g *Game) stateResponse {
 
 	return stateResponse{
 		Code:                g.Code,
+		Revision:            g.Revision,
 		Started:             g.Started,
 		Finished:            g.Finished,
 		Phase:               g.Phase,
@@ -575,7 +586,7 @@ func stateFromGame(g *Game) stateResponse {
 		MaxDays:             g.MaxDays,
 		CurrentTurnTeamID:   turnTeamID,
 		CurrentTurnTeamName: turnTeamName,
-		TurnActionDone:      g.TurnActionDone,
+		TurnActionDone:      cloneBoolMap(g.TurnActionDone),
 		CyclesCompleted:     g.CyclesCompleted,
 		LastRetroDay:        g.LastRetroDay,
 		NextDayIsRetro:      nextDayWouldBeRetro(g),
@@ -765,7 +776,7 @@ func (s *Server) rollCoinsForPlayers(g *Game) {
 		}
 		team := g.Teams[p.TeamID]
 		coin := "tails"
-		if s.rng.Intn(2) == 1 {
+		if rand.Intn(2) == 1 {
 			coin = "heads"
 		}
 		p.CurrentCoin = coin
@@ -809,6 +820,7 @@ func (s *Server) beginRetroPhase(g *Game) {
 }
 
 func (s *Server) closeDayAndEnterRetro(g *Game) {
+	captureDay(g, true, false)
 	g.CurrentDay++
 	s.tickProjectIntegrationDays(g)
 	s.tickBlockedDays(g)
@@ -818,6 +830,7 @@ func (s *Server) closeDayAndEnterRetro(g *Game) {
 }
 
 func (s *Server) closeDayAndAdvance(g *Game) {
+	captureDay(g, retroDueOnDay(g, g.CurrentDay+1), false)
 	g.CurrentDay++
 	s.tickProjectIntegrationDays(g)
 	s.tickBlockedDays(g)
@@ -861,18 +874,20 @@ func (s *Server) logMetrics(g *Game) {
 		return
 	}
 
-	dir := "metrics"
-	_ = os.MkdirAll(dir, 0755)
+	s.metricWrites = append(s.metricWrites, func() {
+		dir := "metrics"
+		_ = os.MkdirAll(dir, 0755)
 
-	filename := filepath.Join(dir, fmt.Sprintf("game_%s.log", g.Code))
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("error saving metrics log: %v\n", err)
-		return
-	}
-	defer f.Close()
-	f.Write(b)
-	f.WriteString("\n")
+		filename := filepath.Join(dir, fmt.Sprintf("game_%s.log", g.Code))
+		f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Printf("error saving metrics log: %v\n", err)
+			return
+		}
+		defer f.Close()
+		f.Write(b)
+		f.WriteString("\n")
+	})
 }
 
 func (s *Server) tickProjectIntegrationDays(g *Game) {
@@ -1120,16 +1135,17 @@ func (s *Server) handleGameWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := stateFromGame(g)
-	s.mu.RUnlock()
 
 	conn, err := gameUpgrader.Upgrade(w, r, nil)
 	if err != nil {
+		s.mu.RUnlock()
 		return
 	}
 	client := &wsClient{conn: conn}
 	s.registerGameClient(code, client)
 
 	_ = client.sendJSON(gameSocketMessage{Type: "state", State: state})
+	s.mu.RUnlock()
 
 	defer func() {
 		s.unregisterGameClient(code, client)
@@ -1192,7 +1208,10 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 
 	req := createRequest{TeamNames: []string{"Синяя", "Зеленая", "Желтая", "Красная"}, MaxDays: 0}
 	if requestExpectsJSON(r) {
-		_ = parseJSONOrForm(r, &req)
+		if err := parseJSONOrForm(r, &req); err != nil {
+			errorJSON(w, http.StatusBadRequest, "Некорректный запрос")
+			return
+		}
 	}
 	if len(req.TeamNames) < 1 {
 		req.TeamNames = []string{"Синяя", "Зеленая", "Желтая", "Красная"}
@@ -1202,6 +1221,9 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := nextGameCode()
+	for s.games[code] != nil {
+		code = nextGameCode()
+	}
 	teams := make(map[string]*Team)
 	teamOrder := make([]string, 0, len(req.TeamNames))
 	for i, name := range req.TeamNames {
@@ -1216,6 +1238,7 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 
 	game := &Game{
 		Code:            code,
+		Revision:        1,
 		Started:         false,
 		Finished:        false,
 		Phase:           "setup",
@@ -1243,6 +1266,10 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.games[code] = game
 	s.mu.Unlock()
+	if err := s.establishSession(w, r, code, facilitatorID); err != nil {
+		errorJSON(w, 500, "Не удалось создать сессию")
+		return
+	}
 
 	if requestExpectsJSON(r) {
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
@@ -1252,7 +1279,7 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/created/"+code+"?facilitator_id="+facilitatorID, http.StatusSeeOther)
+	http.Redirect(w, r, "/created/"+code, http.StatusSeeOther)
 }
 
 func (s *Server) handleJoinGame(w http.ResponseWriter, r *http.Request) {
@@ -1297,18 +1324,13 @@ func (s *Server) handleJoinGame(w http.ResponseWriter, r *http.Request) {
 
 	for _, existing := range g.Players {
 		if strings.EqualFold(existing.Nickname, nickname) {
-			state := stateFromGame(g)
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]string{
-				"game_code":   g.Code,
-				"player_id":   existing.ID,
-				"redirect_to": "/game/" + g.Code + "?player_id=" + existing.ID,
-			})
-			s.broadcastGameState(code, state)
+			errorJSON(w, http.StatusConflict, "Это имя уже занято")
 			return
 		}
 	}
 
+	g.Revision++
 	playerID := s.nextPlayerID()
 	p := &Player{ID: playerID, Nickname: nickname, TeamID: teamID, Role: "player"}
 	g.Players[playerID] = p
@@ -1317,10 +1339,14 @@ func (s *Server) handleJoinGame(w http.ResponseWriter, r *http.Request) {
 	state := stateFromGame(g)
 	s.mu.Unlock()
 
+	if err := s.establishSession(w, r, code, playerID); err != nil {
+		errorJSON(w, 500, "Не удалось создать сессию")
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"game_code":   g.Code,
 		"player_id":   playerID,
-		"redirect_to": "/game/" + g.Code + "?player_id=" + playerID,
+		"redirect_to": "/game/" + g.Code,
 	})
 	s.broadcastGameState(code, state)
 }
@@ -1720,6 +1746,7 @@ func (s *Server) handleDragTask(w http.ResponseWriter, r *http.Request, code str
 	s.autoCompleteIdlePlayers(g)
 
 	if g.ProjectsDone == len(g.ProjectOrder) {
+		captureDay(g, false, true)
 		g.Finished = true
 		g.Phase = "finished"
 		s.appendLog(g, "finish", "Все проекты завершены. Игра окончена.")
@@ -1950,6 +1977,7 @@ func (s *Server) handleSkipTurn(w http.ResponseWriter, r *http.Request, code str
 	s.advanceTurn(g)
 
 	if g.ProjectsDone == len(g.ProjectOrder) {
+		captureDay(g, false, true)
 		g.Finished = true
 		g.Phase = "finished"
 		s.appendLog(g, "finish", "Все проекты завершены. Игра окончена.")
@@ -2018,9 +2046,9 @@ func (s *Server) handleGameRoutes(w http.ResponseWriter, r *http.Request) {
 }
 
 type switchTeamRequest struct {
-	PlayerID   string `json:"player_id"`
-	TargetID   string `json:"target_player_id"` // player to move (facilitator can move others)
-	NewTeamID  string `json:"new_team_id"`
+	PlayerID  string `json:"player_id"`
+	TargetID  string `json:"target_player_id"` // player to move (facilitator can move others)
+	NewTeamID string `json:"new_team_id"`
 }
 
 func (s *Server) handleSwitchTeam(w http.ResponseWriter, r *http.Request, code string) {
@@ -2116,18 +2144,23 @@ func (s *Server) handleSwitchTeam(w http.ResponseWriter, r *http.Request, code s
 }
 
 func main() {
-	s := newServer()
-
-	http.HandleFunc("/api/hello", s.handleHello)
-	http.HandleFunc("/api/", s.handleJoinRedirect)
-	http.HandleFunc("/api/create", s.handleCreateGame)
-	http.HandleFunc("/api/join", s.handleJoinGame)
-	http.HandleFunc("/api/game/", s.handleGameRoutes)
-	http.HandleFunc("/ws/lobby", s.handleLobbyWS)
-	http.HandleFunc("/ws/game", s.handleGameWS)
-
-	fmt.Println("Backend started on :8080")
-	_ = http.ListenAndServe(":8080", nil)
+	path := os.Getenv("DATABASE_PATH")
+	if path == "" {
+		path = "data/featureban.db"
+	}
+	s, err := OpenServer(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer s.Close()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("Backend started on :%s", port)
+	if err := http.ListenAndServe(":"+port, s.Handler()); err != nil {
+		log.Print(err)
+	}
 }
 
 func (s *Server) handleNextDay(w http.ResponseWriter, r *http.Request, code string) {

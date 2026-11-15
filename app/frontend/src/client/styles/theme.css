@@ -896,3 +896,33 @@ a {
   font-size: 13px;
   background: #161b2a;
 }
+
+:root { --panel-bg: var(--card); --border-color: var(--line); --text-color: var(--ink); --bg-color: #141a2b; }
+:where(a, button, input, select):focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+button { font-family: inherit; }
+button:disabled { opacity: .5; cursor: default; }
+button.wip-pill { min-height: 24px; }
+.cfd-header { width: 100%; background: transparent; border: 0; color: var(--ink); padding: 8px 0; }
+.task-actions { flex-wrap: wrap; gap: 5px; }
+.task-btn { min-height: 28px; }
+.report-page { align-items: start; }
+.report-heading h1 { margin: 16px 0 8px; font-family: "IBM Plex Serif", serif; font-size: clamp(28px, 4vw, 44px); }
+.report-heading .subtitle { max-width: 650px; }
+.demo-note { color: var(--accent); line-height: 1.6; max-width: 780px; }
+.report-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.report-number { display: block; margin-top: 10px; font-size: 32px; color: var(--accent-2); }
+.flow-chart { margin: 0; }
+.flow-chart svg { display: block; width: 100%; min-width: 300px; }
+.flow-chart text { fill: var(--muted); font-size: 12px; }
+.flow-chart figcaption { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.chart-legend { margin-top: 14px; }
+.chart-legend span { display: flex; align-items: center; gap: 6px; }
+.chart-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; }
+.table-scroll { overflow-x: auto; }
+.report-page table { border-collapse: collapse; width: 100%; text-align: left; font-size: 14px; }
+.report-page caption { text-align: left; color: var(--muted); padding: 12px 0; }
+.report-page td, .report-page th { padding: 12px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.report-page thead { color: var(--muted); }
+.partial-label { display: block; font-size: 11px; font-weight: 400; color: var(--accent); }
+@media (max-width: 700px) { .report-summary { grid-template-columns: repeat(2, 1fr); } .columns { grid-template-columns: repeat(2, minmax(0, 1fr)); } .card { padding: 16px; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

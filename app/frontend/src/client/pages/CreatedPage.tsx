@@ -1,15 +1,9 @@
 import React from 'react';
-import { useParams, useSearchParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 
 const CreatedPage: React.FC = () => {
   const { gamecode = '' } = useParams();
-  const [params] = useSearchParams();
-  const facilitatorId = params.get('facilitator_id') || '';
   const joinUrl = `${window.location.origin}/joining/${encodeURIComponent(gamecode)}`;
-
-  const facilitatorLink = facilitatorId
-    ? `/game/${encodeURIComponent(gamecode)}?player_id=${encodeURIComponent(facilitatorId)}`
-    : '';
 
   return (
     <div className="page">
@@ -25,19 +19,9 @@ const CreatedPage: React.FC = () => {
             <div className="help">
               Игроки могут подключиться по ссылке: <a href={joinUrl}>{joinUrl}</a>
             </div>
-            <button
-              className="btn"
-              type="button"
-              onClick={() => {
-                if (facilitatorLink) {
-                  window.location.href = facilitatorLink;
-                } else {
-                  window.location.href = '/start';
-                }
-              }}
-            >
+            <Link className="btn" to={`/game/${encodeURIComponent(gamecode)}`}>
               Открыть панель ведущего
-            </button>
+            </Link>
           </div>
         </div>
       </div>

@@ -213,3 +213,16 @@ logs/
 
 app/frontend/node_modules/
 metrics/
+
+# Local application state and generated frontend output
+/app/backend/data/
+/app/frontend/static/
+/app/frontend/.test-build/
+/app/frontend/test-results/
+/app/frontend/playwright-report/
+/app/deploy/.env.deploy
+.superpowers/
+
+# These are application source files, not generated native libraries.
+!/app/frontend/src/client/lib/
+!/app/frontend/src/client/lib/**

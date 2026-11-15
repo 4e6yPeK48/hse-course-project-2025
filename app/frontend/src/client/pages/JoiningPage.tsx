@@ -1,13 +1,8 @@
-import { useEffect, useMemo, useState, type FC } from 'react';
+import { useEffect, useMemo, useRef, useState, type FC } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { getJson, postJson } from '../lib/http';
 import { useGameSocket } from '../lib/useGameSocket';
-import type { GameState, Team } from '../types';
-
-type GameResponse = {
-  teams?: Team[];
-  error?: string;
-};
+import type { GameState, Team, Member } from '../types';
 
 type JoinResponse = {
   redirect_to?: string;
@@ -25,28 +20,34 @@ const JoiningPage: FC = () => {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  useGameSocket(gamecode, (state: GameState) => {
+  const latestRevision = useRef(-1);
+  const receiveState = (state: GameState) => {
+    if (state.revision <= latestRevision.current) return;
+    latestRevision.current = state.revision;
     const teamsList = state.teams;
     if (!teamsList) return;
     setTeams(teamsList);
     if (teamsList[0]) {
       setTeamId((prev) => prev || teamsList[0].id);
     }
-  });
+  };
+  useGameSocket(gamecode, receiveState);
 
   useEffect(() => {
     if (!gamecode) return;
-    getJson<GameResponse>(`/api/game/${encodeURIComponent(gamecode)}`)
+    let active = true;
+    latestRevision.current = -1;
+    setTeams([]);
+    setTeamId('');
+    getJson<Member>(`/api/game/${encodeURIComponent(gamecode)}/me`).then(() => { if (active) navigate(`/game/${encodeURIComponent(gamecode)}`, { replace: true }); }).catch(() => {});
+    getJson<GameState>(`/api/game/${encodeURIComponent(gamecode)}`)
       .then((data) => {
-        if (!Array.isArray(data.teams)) {
-          setError(data.error || 'Не удалось загрузить команды.');
-          return;
-        }
-        setTeams(data.teams);
-        if (!teamId && data.teams[0]) setTeamId(data.teams[0].id);
+        if (!active) return;
+        receiveState(data);
       })
-      .catch(() => setError('Сервер недоступен.'));
-  }, [gamecode, teamId]);
+      .catch(() => { if (active) setError('Сервер недоступен.'); });
+    return () => { active = false; };
+  }, [gamecode, navigate]);
 
   const options = useMemo(() => teams.map((team) => ({
     id: team.id,
@@ -77,17 +78,7 @@ const JoiningPage: FC = () => {
         team_id: teamId
       });
 
-      if (data.redirect_to) {
-        navigate(data.redirect_to);
-        return;
-      }
-
-      if (data.game_code && data.player_id) {
-        navigate(`/game/${encodeURIComponent(data.game_code)}?player_id=${encodeURIComponent(data.player_id)}`);
-        return;
-      }
-
-      setError('Некорректный ответ сервера.');
+      navigate(`/game/${encodeURIComponent(data.game_code || gamecode)}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Сервер недоступен. Попробуйте снова.';
       setError(message);
@@ -129,6 +120,7 @@ const JoiningPage: FC = () => {
               id="nickname"
               className="field"
               type="text"
+              autoComplete="nickname"
               maxLength={20}
               placeholder="Введите никнейм..."
               value={nickname}

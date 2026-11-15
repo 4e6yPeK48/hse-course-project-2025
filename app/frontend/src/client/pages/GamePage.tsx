@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, useSearchParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { getJson, postJson } from '../lib/http';
 import { useGameSocket } from '../lib/useGameSocket';
-import type { GameState, HistoryEntry, Member, Project, Task, Team } from '../types';
+import { newerState } from '../lib/connection';
+import type { GameState, Member, Project, Task, Team } from '../types';
 
 
 type DragState = {
@@ -112,7 +113,7 @@ const TeamMembers: React.FC<TeamMembersProps> = ({ members, currentTeamId, allTe
               <select
                 className="switch-team-select"
                 value=""
-                title="Переместить в другую команду"
+                aria-label={`Переместить ${member.nickname} в другую команду`}
                 onChange={(e) => { if (e.target.value) onSwitch?.(member.id, e.target.value); }}
               >
                 <option value="" disabled>→</option>
@@ -154,6 +155,7 @@ const WipPill: React.FC<{
         ({count}/
         <input
           className="wip-inline-input"
+          aria-label="WIP-лимит"
           type="number"
           min={1}
           max={30}
@@ -172,13 +174,15 @@ const WipPill: React.FC<{
 
   if (isEditable) {
     return (
-      <span
+      <button
+        type="button"
+        aria-label={`Изменить WIP-лимит: ${limit ?? 1}`}
         className={`wip-pill wip-editable ${isOver ? 'over' : ''}`}
         onClick={open}
         title="Нажмите, чтобы изменить WIP-лимит"
       >
         ({count}/{limit ?? '—'})
-      </span>
+      </button>
     );
   }
 
@@ -309,16 +313,31 @@ const ProjectKanban: React.FC<ProjectKanbanProps> = ({ teams, projects, wipLimit
 
 const GamePage: React.FC = () => {
   const { gamecode = '' } = useParams();
-  const [params] = useSearchParams();
-  const playerId = params.get('player_id') || '';
+  const activeCode = useRef(gamecode);
+  activeCode.current = gamecode;
+  const [identity, setIdentity] = useState<Member | null>(null);
+  const playerId = identity?.id || '';
 
-  const [state, setState] = useState<GameState | null>(null);
+  const [state, setRawState] = useState<GameState | null>(null);
+  const setState = useCallback((incoming: GameState) => {
+    if (incoming.code && incoming.code !== activeCode.current) return;
+    setRawState(current => newerState(current, incoming));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    setRawState(null);
+    setIdentity(null);
+    getJson<Member>(`/api/game/${encodeURIComponent(gamecode)}/me`)
+      .then(me => { if (active) setIdentity(me); })
+      .catch(() => { if (active) setIdentity(null); });
+    return () => { active = false; };
+  }, [gamecode]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<{ text: string; type: 'ok' | 'err' | '' }>({
     text: '',
     type: ''
   });
-  const [selectedTaskId, setSelectedTaskId] = useState('');
   const [flashTaskId, setFlashTaskId] = useState('');
   const [isCfdOpen, setIsCfdOpen] = useState(false);
   const dragRef = useRef<DragState>({ taskId: '', teamId: '', fromStage: '' });
@@ -332,17 +351,13 @@ const GamePage: React.FC = () => {
   };
 
   const playerRecord = useMemo(() => {
-    if (!state) return null;
-    for (const team of state.teams || []) {
-      for (const member of team.members || []) {
-        if (member.id === playerId) return member;
-      }
+    if (!identity) return null;
+    for (const team of state?.teams || []) {
+      const member = team.members?.find(member => member.id === identity.id);
+      if (member) return member;
     }
-    if (state.facilitator_id === playerId) {
-      return { id: playerId, role: 'facilitator', nickname: 'facilitator' } as Member;
-    }
-    return null;
-  }, [state, playerId]);
+    return identity;
+  }, [state, identity]);
 
   const isFacilitator = playerRecord?.role === 'facilitator';
 
@@ -350,14 +365,14 @@ const GamePage: React.FC = () => {
     if (!gamecode) return;
     try {
       const data = await getJson<GameState>(`/api/game/${encodeURIComponent(gamecode)}`);
-      setState(data);
+      if (activeCode.current === gamecode) setState(data);
     } catch (err) {
       if (!silent) setStatusMessage('Сервер недоступен.', 'err');
     }
   }, [gamecode]);
 
   useEffect(() => {
-    loadState(true);
+    loadState(false);
     if (wsConnected) {
       return () => undefined;
     }
@@ -400,7 +415,6 @@ const GamePage: React.FC = () => {
         return;
       }
     }
-    const team = state?.teams?.find((t) => t.id === teamId);
     const myCoin = playerRecord?.current_coin;
     if (myCoin === 'tails' && task && !task.blocked) {
       const validForward =
@@ -457,24 +471,6 @@ const GamePage: React.FC = () => {
       window.setTimeout(() => setFlashTaskId(''), 550);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Ошибка обновления.';
-      setStatusMessage(message, 'err');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const makeMove = async () => {
-    if (!gamecode) return;
-    try {
-      setBusy(true);
-      const payload: { player_id: string; task_id?: string } = { player_id: playerId };
-      if (selectedTaskId) payload.task_id = selectedTaskId;
-      const data = await postJson<GameState>(`/api/game/${encodeURIComponent(gamecode)}/move`, payload);
-      setState(data);
-      setSelectedTaskId('');
-      setStatusMessage('Ход выполнен.', 'ok');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Ошибка хода.';
       setStatusMessage(message, 'err');
     } finally {
       setBusy(false);
@@ -542,7 +538,6 @@ const GamePage: React.FC = () => {
     () => state?.teams?.find((t) => t.id === playerRecord?.team_id) || null,
     [state?.teams, playerRecord]
   );
-  const myTeamStageLimits = myTeam?.wip_limits || {};
 
   const metaLine = useMemo(() => {
     if (!state) return '';
@@ -587,6 +582,7 @@ const GamePage: React.FC = () => {
               <div className="help">{metaLine}</div>
             </div>
             <div className="badge-row">
+              <span role="status" className="badge-chip">{wsConnected ? 'Подключено' : 'Переподключение · обновляем по HTTP'}</span>
               <span className="badge-chip">{roleLabel}</span>
               <span className="badge-chip">{phaseLabel}</span>
               <span className="badge-chip turn">{turnLabel}</span>
@@ -594,6 +590,8 @@ const GamePage: React.FC = () => {
           </div>
         </div>
 
+        {!identity && <p className="help">Для действий <Link to={`/joining/${encodeURIComponent(gamecode)}`}>войдите в игру</Link> в этом браузере.</p>}
+        {isFacilitator && <p><Link className="btn secondary" to={`/game/${encodeURIComponent(gamecode)}/report`}>{state?.finished ? 'Игра завершена · открыть отчёт' : 'Отчёт по игре'}</Link></p>}
         <div className="layout-grid">
           <div className="card">
             <h2 style={{ marginTop: 0 }}>{isFacilitator ? "Командные доски" : "Доска задач"}</h2>
@@ -602,7 +600,7 @@ const GamePage: React.FC = () => {
                 <strong>Доступные действия:</strong> {myActionsHint}
               </div>
             )}
-            <div className={`status ${status.type}`}>{status.text}</div>
+            <div role="status" className={`status ${status.type}`}>{status.text}</div>
             <div style={{ height: 16 }} />
             {visibleTeams.map((team) => (
               <div key={team.id} className="card compact" style={{ marginBottom: 12 }}>
@@ -670,7 +668,6 @@ const GamePage: React.FC = () => {
                           'task',
                           task.blocked ? 'blocked' : '',
                           isDone ? 'task-done' : '',
-                          selectedTaskId === task.id ? 'sel' : '',
                           flashTaskId === task.id ? 'flash' : ''
                         ].join(' ');
 
@@ -679,10 +676,6 @@ const GamePage: React.FC = () => {
                             key={task.id}
                             className={taskClass}
                             draggable={canDrag}
-                            onClick={() => {
-                              if (isDone) return;
-                              setSelectedTaskId(selectedTaskId === task.id ? '' : task.id);
-                            }}
                             onDragStart={(event) => {
                               if (isDone) return;
                               dragRef.current = { taskId: task.id, teamId: team.id, fromStage: stage };
@@ -697,9 +690,15 @@ const GamePage: React.FC = () => {
                             }}
                           >
                             <strong>{task.id}</strong> / {task.project_id}
+                            {canActOnTask && !task.blocked && (
+                              <div className="task-actions"><button type="button" className="task-btn" onClick={() => {
+                                dragRef.current = { taskId: task.id, teamId: team.id, fromStage: stage };
+                                handleDrop(team.id, STAGES[STAGES.indexOf(stage) + 1]);
+                              }}>{stage === 'ready' ? 'Взять задачу' : 'Продвинуть →'}</button></div>
+                            )}
                             {task.penalty ? ' [штраф]' : ''} {task.blocked ? '[blocked]' : ''}
                             <span className="task-owner">Ответственный: {owner}</span>
-                            {!isDone && (task.owner_id || task.blocked) && (
+                            {!isDone && (task.blocked || (task.owner_id === playerId && playerRecord?.current_coin === 'heads')) && (
                               <div className="task-actions">
                                 <button
                                   type="button"
@@ -836,15 +835,18 @@ const GamePage: React.FC = () => {
                   </div>
                 </div>
                 <div className="metrics-cfd">
-                  <h3 
-                    className="cfd-header" 
+                  <button
+                    type="button"
+                    aria-expanded={isCfdOpen}
+                    aria-controls="current-cfd"
+                    className="cfd-header"
                     onClick={() => setIsCfdOpen(!isCfdOpen)}
                   >
                     CFD (Текущий статус)
                     <span>{isCfdOpen ? '▲' : '▼'}</span>
-                  </h3>
+                  </button>
                   {isCfdOpen && (
-                    <div className="cfd-content">
+                    <div className="cfd-content" id="current-cfd">
                       <div className="cfd-row">
                         <span className="cfd-label">Ready:</span> <span className="cfd-val">{state.metrics.cfd?.ready || 0}</span>
                       </div>
@@ -874,7 +876,7 @@ type FacilitatorProps = {
   state: GameState;
   playerId: string;
   gamecode: string;
-  setState: React.Dispatch<React.SetStateAction<GameState | null>>;
+  setState: (state: GameState) => void;
   setStatus: (text: string, type?: 'ok' | 'err' | '') => void;
   setBusy: React.Dispatch<React.SetStateAction<boolean>>;
 };

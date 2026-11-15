@@ -65,6 +65,7 @@ export type GameMetrics = {
 };
 
 export type GameState = {
+  revision: number;
   code?: string;
   current_day: number;
   max_days: number;
@@ -82,4 +83,14 @@ export type GameState = {
   projects?: Project[];
   history?: HistoryEntry[];
   metrics?: GameMetrics;
+};
+
+export type GameReport = {
+  code: string;
+  revision: number;
+  phase: string;
+  finished: boolean;
+  summary: GameMetrics;
+  days: { day: number; iteration: number; partial: boolean; metrics: GameMetrics }[];
+  iterations: { number: number; start_day: number; end_day: number; partial: boolean; throughput: number; average_wip: number; lead_time: number; cycle_time: number }[];
 };
